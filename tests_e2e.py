@@ -1,6 +1,7 @@
 """端到端冒烟测试：通过 HTTP API 覆盖主要业务路径。"""
 import json
 import sys
+import time
 import urllib.request
 import urllib.error
 
@@ -920,6 +921,41 @@ s, e = call("POST", "/api/reagents/merge/confirm",
 check("步骤变化后确认被拒 409", s == 409 and "步骤" in e["detail"], (s, e))
 s, still_src2 = call("GET", f"/api/reagents/{merge_src}")
 check("步骤变化拒绝后来源仍在（无部分迁移）", still_src2 is not None and still_src2["id"] == merge_src, s)
+
+# 乐观并发：预览后经既有安全确认接口再次确认，措施 / 备注 / 确认指纹未变、
+# 仅确认时间刷新 → 同样拒绝（不得按旧预览迁移），令牌作废
+s, pv2b = call("POST", "/api/reagents/merge/preview",
+               {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt})
+check("仅确认时间刷新场景：预览 200", s == 200 and pv2b["will_reset_to_review_count"] == 1,
+      (s, pv2b))
+s, plan_before_reconfirm = call("GET", f"/api/plans/{merge_plan}")
+confirmed_before = next(
+    st for st in plan_before_reconfirm["steps"] if st["id"] == confirmed_src_step_id
+)
+confirmed_at_before = confirmed_before["safety_confirmed_at"]
+time.sleep(0.05)  # 保证再次确认生成的确认时间晚于预览时刻
+s, uc = call("PUT", f"/api/plans/{merge_plan}/steps/{confirmed_src_step_id}/safety",
+             {"safety_measures": ["goggles"], "safety_note": None, "confirmed": True})
+check("再次确认成功且仍为有效确认", s == 200 and uc["safety"]["confirmed"] is True, (s, uc))
+confirmed_at_after = uc["safety"]["confirmed_at"]
+check("措施/备注/确认指纹未变而确认时间已刷新",
+      confirmed_at_after and confirmed_at_after != confirmed_at_before,
+      (confirmed_at_before, confirmed_at_after))
+s, e = call("POST", "/api/reagents/merge/confirm",
+            {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+             "confirm_token": pv2b["confirm_token"]})
+check("仅确认时间刷新也被拒 409 并提示重新预览", s == 409 and "重新预览" in e["detail"]
+      and "确认时间" in e["detail"], (s, e))
+s, e_reuse = call("POST", "/api/reagents/merge/confirm",
+                  {"source_reagent_id": merge_src, "target_reagent_id": merge_tgt,
+                   "confirm_token": pv2b["confirm_token"]})
+check("令牌一次性（确认时间刷新被拒后不可复用）", s == 409, (s, e_reuse))
+s, still_src2b = call("GET", f"/api/reagents/{merge_src}")
+check("确认时间刷新拒绝后来源仍在", s == 200 and still_src2b["id"] == merge_src, s)
+s, plan_refused2b = call("GET", f"/api/plans/{merge_plan}")
+check("确认时间刷新拒绝后步骤引用未迁移", all(
+    (st["reagent_id"] == merge_src) == (st["id"] in src_step_ids)
+    for st in plan_refused2b["steps"]), plan_refused2b["steps"])
 
 # 重新预览 → 确认成功
 s, pv3 = call("POST", "/api/reagents/merge/preview",
